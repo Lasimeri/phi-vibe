@@ -8,4 +8,7 @@
  * and sim (n x k). 0, or the card's error. */
 int knn_card(vg *v, const float *E, int n, int d, int k, int *nb, float *sim);
 
+/* the same ranked by dot product minus colbias[j] (a per-candidate offset; NULL for none) */
+int knn_card_bias(vg *v, const float *E, int n, int d, int k, const float *colbias, int *nb, float *sim);
+
 #endif

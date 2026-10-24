@@ -1,0 +1,12 @@
+[Unit]
+Description=phi-vibe: learn from VLC plays and queue the next song (vibed)
+After=graphical-session.target phivibe-vgd.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/vibed
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=phi-vibe: keep the card's GEMM daemon (vgd) running on the Xeon Phi
+
+[Service]
+ExecStart=%h/.local/lib/phivibe/vgd-keeper.sh
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

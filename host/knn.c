@@ -6,7 +6,7 @@
 
 #define BLOCK 512
 
-int knn_card(vg *v, const float *E, int n, int d, int k, int *nb, float *sim)
+int knn_card_bias(vg *v, const float *E, int n, int d, int k, const float *colbias, int *nb, float *sim)
 {
 	const uint64_t mark = vg_mark(v);
 	vt tE = vg_tensor(v, n, d), tET = vg_tensor(v, d, n), S = vg_tensor(v, BLOCK, n);
@@ -31,7 +31,7 @@ int knn_card(vg *v, const float *E, int n, int d, int k, int *nb, float *sim)
 			int have = 0;
 			for (int j = 0; j < n; j++) {
 				if (j == r0 + i) continue;
-				const float x = row[j];
+				const float x = colbias ? row[j] - colbias[j] : row[j];
 				if (have == k && x <= bs[k - 1]) continue;
 				int p = have < k ? have++ : k - 1;
 				while (p > 0 && bs[p - 1] < x) { bs[p] = bs[p - 1]; bi[p] = bi[p - 1]; p--; }
@@ -44,4 +44,9 @@ int knn_card(vg *v, const float *E, int n, int d, int k, int *nb, float *sim)
 	free(s);
 	vg_release(v, mark);
 	return rc;
+}
+
+int knn_card(vg *v, const float *E, int n, int d, int k, int *nb, float *sim)
+{
+	return knn_card_bias(v, E, n, d, k, NULL, nb, sim);
 }
