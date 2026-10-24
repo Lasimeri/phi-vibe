@@ -22,8 +22,9 @@
  *
  * A skip (Next before the end) is learnt from at once, and then the plan is repaired: from the last song you let
  * play, with the skipped one blocked. When the repaired plan starts with another song than the pick VLC just
- * started, VLC plays the new song at once (the stale pick played for the fraction of a second it took is not
- * logged). A track VLC starts that you lined up yourself is never replaced.
+ * started, VLC plays the new song at once, inserted after the stale pick; the stale pick stays in the playlist and its
+ * fraction of a second is not logged. vibed never removes the track VLC is playing, and never replaces a track you
+ * lined up yourself.
  *
  * Files in ~/.local/share/phivibe: events.tsv (the play log), pref.bin (the network), status.txt (now, the plan,
  * the weights); emb.bin/emb.tsv from vibe-train. The card's GEMM daemon (vgd) must be running; without it vibed
@@ -474,12 +475,15 @@ static void load_pending(void)
 }
 
 /* removes a track we added, only while that id still holds our url (VLC numbers its items afresh after it
- * restarts); 1 when removed */
+ * restarts), and never the track VLC is playing; 1 when removed */
 static int remove_ours(const char *id, const char *uri, const char *why)
 {
 	char u[8192];
 	int done = 0;
-	if (!no_touch && id[0] && mp_track_url(M, id, u, sizeof u) == 0 && !strcmp(u, uri) && mp_remove(M, id) == 0) {
+	mp_state now;
+	const int playing_it = mp_read(M, &now) == 1 && !strcmp(now.trackid, id);
+	if (playing_it) say("not taking back %s: VLC is playing it", rel_of(song_of_url(uri)));
+	else if (!no_touch && id[0] && mp_track_url(M, id, u, sizeof u) == 0 && !strcmp(u, uri) && mp_remove(M, id) == 0) {
 		say("took back %s (%s)", rel_of(song_of_url(uri)), why);
 		done = 1;
 	}
@@ -609,7 +613,8 @@ static void decide(void)
  * our picks, it was planned before the skip; the network has now learnt from the skip (close_play), so plan again
  * from the last song you let play (the latest play that did not end in a skip; the skipped song itself when there
  * is none), with every song skipped since blocked, the way a navigating agent repairs its path around newly found
- * obstacles. When the new plan starts elsewhere, VLC plays the new song at once and the stale pick goes. Returns 1
+ * obstacles. When the new plan starts elsewhere, VLC plays the new song at once (the stale pick stays in the
+ * playlist, before it). Returns 1
  * when VLC was switched.
  */
 static int replan_after_skip(const mp_state *s)
@@ -700,7 +705,9 @@ static void tick(void)
 		const int there = (sw.id[0] && !strcmp(s.trackid, sw.id)) || !strcmp(s.url, sw.uri);
 		if (!there && unix_now() < sw.until) return;
 		sw.active = 0;
-		if (there) { if (strcmp(sw.stale.id, s.trackid)) remove_ours(sw.stale.id, sw.stale.uri, "replaced after the skip"); }
+		/* the pick VLC started on your Next stays in the playlist (before the new song, so VLC does not come back to
+		 * it); it is just no longer ours to take back */
+		if (there) forget(sw.stale.id);
 		else say("VLC did not switch to the re-planned song within 5 s");
 		cur.id[0] = 0;
 	}

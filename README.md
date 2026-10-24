@@ -59,7 +59,7 @@ It has two heads and three mixing weights:
 **When you skip** (Next before the end), the pick VLC starts was planned before the skip. `vibed` handles it like a navigating agent that finds a new obstacle:
 - the network learns from the skip at once;
 - the plan is repaired from the last song you let play (the latest play that did not end in a skip), with every song skipped since blocked;
-- if the repaired plan starts with a different song, VLC switches to it straight away, and the stale pick, heard for about a tenth of a second, is removed and not logged as a play;
+- if the repaired plan starts with a different song, VLC switches to it straight away, inserted right after the stale pick. The stale pick, heard for about a tenth of a second, stays in the playlist but is not logged as a play. `vibed` never removes the track VLC is playing;
 - a track you lined up yourself is never replaced.
 
 Copies of one recording count as one song: blocking, recency and skips all treat them together. Copies are vibe vectors at cosine ≥ 0.9999; 385 songs in the library have at least one.
@@ -135,9 +135,10 @@ All on one 7120A (61 cores, 1.238 GHz, 16 GB GDDR5) in a Ryzen 7 5800X desktop. 
 
 **Skips** were tested on a private D-Bus session, with a second VLC on dummy audio and video outputs, so nothing touched the real player or the speakers. Three runs of four skips after the fixes below (`tools/skiptest.sh`; a first run found them):
 - **Detection:** every skip was classified `next`. VLC reports `Stopped` for an instant while it switches tracks, so a stop only counts once it has lasted 1 s.
-- **Learning and switch:** the network took 16 Adam steps on the card in 87 to 92 ms. VLC played the re-planned song 0.115 to 0.227 s after Next (6 switches).
+- **Learning and switch:** the network took 16 Adam steps on the card in 87 to 92 ms. VLC played the re-planned song 0.115 to 0.233 s after Next (9 switches in the runs after the fixes).
 - **Agreement:** when the repaired plan agreed with the queued pick, the pick was kept.
 - **Your tracks:** a track lined up by hand played and was not replaced.
+- **Nothing playing is removed:** after every switch, every track that played since Next was still in the playlist (0 removed in 4 skips). An earlier build deleted the stale pick, the song VLC had just started on your Next, which looked like the playing song vanishing.
 - **Copies:** a skipped song's copy in another folder was chosen 0 times, after the fix. Before it, a skip of "Pegboards - Hero" brought back its copy from `ytmusic/`.
 
 **Copies** (`dups`): nearest-song cosine ≥ 0.9999 for 385 songs (most exactly 1.000000), against 17 between 0.9995 and 0.9999.
