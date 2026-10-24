@@ -133,7 +133,7 @@ All on one 7120A (61 cores, 1.238 GHz, 16 GB GDDR5) in a Ryzen 7 5800X desktop. 
   - one seed passes everything at 10⁻³, worst 6.9 × 10⁻³.
 - Cold start: 50 untrained decisions through D* Lite with 0 repeats, 0 hops off the graph, 0 empty plans and 0 NaN. Scoring all 6,027 songs on the card takes 2.08 ms.
 
-**Skips** were tested on a private D-Bus session, with a second VLC on dummy audio and video outputs, so nothing touched the real player or the speakers. Four runs of four skips (`tools/skiptest.sh`):
+**Skips** were tested on a private D-Bus session, with a second VLC on dummy audio and video outputs, so nothing touched the real player or the speakers. Three runs of four skips after the fixes below (`tools/skiptest.sh`; a first run found them):
 - **Detection:** every skip was classified `next`. VLC reports `Stopped` for an instant while it switches tracks, so a stop only counts once it has lasted 1 s.
 - **Learning and switch:** the network took 16 Adam steps on the card in 87 to 92 ms. VLC played the re-planned song 0.115 to 0.227 s after Next (6 switches).
 - **Agreement:** when the repaired plan agreed with the queued pick, the pick was kept.
