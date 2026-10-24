@@ -16,6 +16,7 @@ cc "${flags[@]}" -o "$out/dstest" "$here/tools/dstest.c" "$here/host/dstar.c" "$
 cc "${flags[@]}" -o "$out/prefcheck" "$here/tools/prefcheck.c" "$here/host/pref.c" "$here/host/dstar.c" "$here/host/emb.c" "$here/host/knn.c" "$here/host/vg.c" -lm
 cc "${flags[@]}" -o "$out/vibed" "$here/host/vibed.c" "$here/host/pref.c" "$here/host/dstar.c" "$here/host/emb.c" "$here/host/knn.c" "$here/host/mpris.c" "$here/host/vg.c" -lm -lsystemd
 cc "${flags[@]}" -o "$out/graphstat" "$here/tools/graphstat.c" "$here/host/emb.c" "$here/host/knn.c" "$here/host/vg.c" -lm
+cc "${flags[@]}" -o "$out/dups" "$here/tools/dups.c" "$here/host/emb.c" "$here/host/knn.c" "$here/host/vg.c" -lm
 VCC="${PHI_LLVM_BIN:-$HOME/.cache/intel-phi-llvm-build/llvm/bin}/clang"
 SYS="${PHI_SYSROOT_7120A:-$HOME/.cache/intel-phi-7120a-build/toolchain/sysroot}"
 "$VCC" --target=x86_64-unknown-linux-musl -march=knc --sysroot="$SYS" "${flags[@]}" -fno-jump-tables -falign-loops=1 -fPIE \

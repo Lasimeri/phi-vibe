@@ -157,3 +157,30 @@ int graph_build_csls(vg *v, const float *X, int n, int d, int k, int **off, int 
 	free(nb); free(sim);
 	return out;
 }
+
+static int find_rep(int *p, int i)
+{
+	while (p[i] != i) { p[i] = p[p[i]]; i = p[i]; }
+	return i;
+}
+
+int dup_groups(vg *v, const float *X, int n, int d, double thr, int *rep)
+{
+	const int k = 8;
+	int *nb = malloc((size_t)n * k * sizeof(int));
+	float *sim = malloc((size_t)n * k * sizeof(float));
+	for (int i = 0; i < n; i++) rep[i] = i;
+	if (knn_card(v, X, n, d, k, nb, sim)) { free(nb); free(sim); return -1; }
+	for (int a = 0; a < n; a++)
+		for (int j = 0; j < k; j++) {
+			const int b = nb[(size_t)a * k + j];
+			if (b < 0 || sim[(size_t)a * k + j] < thr) break;   /* best first */
+			const int ra = find_rep(rep, a), rb = find_rep(rep, b);
+			if (ra != rb) rep[ra > rb ? ra : rb] = ra < rb ? ra : rb;
+		}
+	int with = 0, *size = calloc((size_t)n, sizeof(int));
+	for (int i = 0; i < n; i++) size[rep[i] = find_rep(rep, i)]++;
+	for (int i = 0; i < n; i++) with += size[rep[i]] > 1;
+	free(size); free(nb); free(sim);
+	return with;
+}

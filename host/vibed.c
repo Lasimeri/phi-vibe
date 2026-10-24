@@ -1,11 +1,14 @@
 /*
  * vibed: watches VLC, learns from every play, and queues the next song.
  *
- * usage: vibed [-i] [-n]
+ * usage: vibed [-i] [-n] [-b MPRIS_NAME] [-d STATE_DIR]
  *   -i  import the play history in the vlc-discord journal first (only when there is no event log yet)
  *   -n  watch, learn and plan, but never touch VLC's playlist
+ *   -b  only this player (an exact bus name such as org.mpris.MediaPlayer2.vlc.instance1234; default: the first VLC)
+ *   -d  keep the play log, the network and the status there instead of ~/.local/share/phivibe
  *
- * Every second it reads VLC over MPRIS. A play ends when VLC moves to another track or stops; the play is logged
+ * It reads VLC over MPRIS every second, and at once when VLC announces a change. A play ends when VLC moves to
+ * another track or stops; the play is logged
  * with the fraction of the song played and how it ended, measured, not judged:
  *   natural  VLC reached the end (the last position seen within one poll of the length)
  *   next     the track VLC had lined up after it started instead (Next pressed)
@@ -14,8 +17,13 @@
  * After each play the preference network (host/pref.h) takes a few Adam steps on every logged play, its products
  * on the card. When a track starts, the planner (host/dstar.h) runs from it over the vibe graph with the network's
  * costs, and the plan's first song goes into VLC right after the current track, unless you have queued tracks
- * after it yourself (then nothing is added) or VLC shuffles. A pick of ours that is still waiting is taken back when
- * the plan changes or when you add tracks.
+ * after it yourself or VLC shuffles (then nothing is added). A pick of ours that is still waiting is taken back when the plan
+ * changes or when you add tracks; our older picks that still follow the current track are taken out.
+ *
+ * A skip (Next before the end) is learnt from at once, and then the plan is repaired: from the last song you let
+ * play, with the skipped one blocked. When the repaired plan starts with another song than the pick VLC just
+ * started, VLC plays the new song at once (the stale pick played for the fraction of a second it took is not
+ * logged). A track VLC starts that you lined up yourself is never replaced.
  *
  * Files in ~/.local/share/phivibe: events.tsv (the play log), pref.bin (the network), status.txt (now, the plan,
  * the weights); emb.bin/emb.tsv from vibe-train. The card's GEMM daemon (vgd) must be running; without it vibed
@@ -66,6 +74,7 @@ static double last_card_try;
 static double last_loss[3] = { NAN, NAN, NAN };
 static int no_touch;
 static double *lengths;   /* seconds, per song, from the extraction index */
+static int *rep;          /* copies of one recording (same audio in two folders) share rep[]: see dup_groups */
 
 static void say(const char *fmt, ...)
 {
@@ -270,7 +279,7 @@ static void recency(int b, int k, double t, float *r)
 {
 	r[0] = r[1] = 0;
 	for (int j = k - 1; j >= 0; j--)
-		if (plays[j].song == b) {
+		if (plays[j].song >= 0 && rep[plays[j].song] == rep[b]) {   /* a copy of b played: b played */
 			r[0] = (float)(1.0 / (1 + (k - 1 - j)));
 			r[1] = (float)exp(-((t - plays[j].t1) / 3600.0) / 12.0);
 			return;
@@ -286,6 +295,7 @@ static uint64_t xr(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; 
 static void learn(int steps)
 {
 	if (!card || nplays < 2) return;
+	const double t0 = unix_now();
 	pref_example *fr = malloc((size_t)nplays * sizeof *fr);
 	float (*gx)[PREF_X] = malloc((size_t)nplays * sizeof *gx);
 	pref_goal_ex *go = malloc((size_t)nplays * sizeof *go);
@@ -331,8 +341,8 @@ static void learn(int steps)
 	free(bf); free(bg); free(bc);
 	if (card) {
 		pref_save(P, path_pref);
-		say("learned from %d plays (%d fraction, %d goal, %d choice examples): losses %.4f %.4f %.4f; alpha %.3f beta %.3f kappa %.3f",
-		    nplays, nfr, ngo, nch, last_loss[0], last_loss[1], last_loss[2], pref_alpha(P), pref_beta(P), pref_kappa(P));
+		say("learned from %d plays in %.0f ms (%d steps; %d fraction, %d goal, %d choice examples): losses %.4f %.4f %.4f; alpha %.3f beta %.3f kappa %.3f",
+		    nplays, 1e3 * (unix_now() - t0), steps, nfr, ngo, nch, last_loss[0], last_loss[1], last_loss[2], pref_alpha(P), pref_beta(P), pref_kappa(P));
 	}
 out:
 	free(fr); free(gx); free(go); free(ch);
@@ -352,6 +362,8 @@ static int ensure_card(void)
 	if (!DS) {
 		if (graph_build_csls(card, E.mean, E.n, E.d, 16, &goff, &gadj)) { vg_close(card); card = NULL; return 0; }
 		DS = ds_new(E.n, E.mean, E.d, goff, gadj, PREF_ALPHA_FLOOR);
+		const int with = dup_groups(card, E.mean, E.n, E.d, 0.9999, rep);
+		say("copies of one recording: %d songs have one (vibe cosine >= 0.9999)", with);
 		say("vibe graph: %d songs, %d edges", E.n, goff[E.n]);
 	}
 	say("card connected (arena %llu MiB)", (unsigned long long)(vg_arena(card) >> 20));
@@ -367,10 +379,21 @@ static struct {
 	play pl;
 	double last_pos;
 } cur;
-static struct { char id[128]; int song; char uri[8192]; } pend = { "", -1, "" };
-static int prev_blocked = -1;
+/* our picks: the one waiting (pend), and every track we added (to tell them from yours) */
+typedef struct { char id[128]; int song; char uri[8192]; } pick;
+static pick pend = { "", -1, "" };
+#define OURS 64
+static pick ours[OURS];
+static int nours;
+/* after a skip: the re-planned track we told VLC to play, the stale pick it replaces, how long we wait for VLC */
+static struct { int active; char id[128], uri[8192]; pick stale; double until; } sw;
+#define BLOCKS 64
+static int blocked[BLOCKS], nblocked;
 static int plan[32], nplan;
 static double plan_cost;
+static int skips_replanned, skips_kept;
+static int shuffling;   /* VLC's Shuffle, read each tick */
+static double stop_since;   /* when VLC was first seen stopped (it reports Stopped for an instant while switching tracks) */
 
 static void write_status(void)
 {
@@ -391,18 +414,43 @@ static void write_status(void)
 	if (isnan(last_loss[0])) fprintf(f, "losses    - (no training since vibed started)\n");
 	else fprintf(f, "losses    fraction %.4f  goal %.4f  choice %.4f\n", last_loss[0], last_loss[1], last_loss[2]);
 	fprintf(f, "plays     %d logged\n", nplays);
+	fprintf(f, "skips     %d re-planned to another song, %d kept the queued one (since vibed started)\n", skips_replanned, skips_kept);
 	fclose(f);
 	rename(tmp, path_status);
 }
 
-/* our waiting pick survives a restart of vibed: ~/.local/share/phivibe/pending holds its track id and url */
+/* the picks survive a restart of vibed: the pending file holds the waiting pick on its first line (empty when none),
+ * then every other track we added, one "id \t url" per line */
 static char path_pending[4200];
 static void save_pending(void)
 {
 	FILE *f = fopen(path_pending, "w");
 	if (!f) return;
-	if (pend.id[0]) fprintf(f, "%s\t%s\n", pend.id, pend.uri);
+	fprintf(f, "%s%s%s\n", pend.id, pend.id[0] ? "\t" : "", pend.id[0] ? pend.uri : "");
+	for (int i = 0; i < nours; i++) if (strcmp(ours[i].id, pend.id)) fprintf(f, "%s\t%s\n", ours[i].id, ours[i].uri);
 	fclose(f);
+}
+
+static void remember(const pick *p)
+{
+	if (!p->id[0]) return;
+	for (int i = 0; i < nours; i++) if (!strcmp(ours[i].id, p->id)) { ours[i] = *p; return; }
+	if (nours == OURS) { memmove(ours, ours + 1, sizeof ours[0] * (OURS - 1)); nours--; }
+	ours[nours++] = *p;
+}
+
+static int is_ours(const char *id)
+{
+	for (int i = 0; i < nours; i++) if (!strcmp(ours[i].id, id)) return i;
+	return -1;
+}
+
+static void forget(const char *id)
+{
+	const int i = is_ours(id);
+	if (i < 0) return;
+	memmove(ours + i, ours + i + 1, sizeof ours[0] * (size_t)(nours - i - 1));
+	nours--;
 }
 
 static void load_pending(void)
@@ -410,26 +458,38 @@ static void load_pending(void)
 	FILE *f = fopen(path_pending, "r");
 	char line[8400];
 	if (!f) return;
-	if (fgets(line, sizeof line, f)) {
+	for (int first = 1; fgets(line, sizeof line, f); first = 0) {
 		line[strcspn(line, "\n")] = 0;
 		char *tab = strchr(line, '\t');
-		if (tab) {
-			*tab = 0;
-			snprintf(pend.id, sizeof pend.id, "%.127s", line);
-			snprintf(pend.uri, sizeof pend.uri, "%s", tab + 1);
-			pend.song = song_of_url(pend.uri);
-		}
+		if (!tab) continue;
+		*tab = 0;
+		pick p;
+		snprintf(p.id, sizeof p.id, "%.127s", line);
+		snprintf(p.uri, sizeof p.uri, "%s", tab + 1);
+		p.song = song_of_url(p.uri);
+		if (first) pend = p;
+		remember(&p);
 	}
 	fclose(f);
 }
 
+/* removes a track we added, only while that id still holds our url (VLC numbers its items afresh after it
+ * restarts); 1 when removed */
+static int remove_ours(const char *id, const char *uri, const char *why)
+{
+	char u[8192];
+	int done = 0;
+	if (!no_touch && id[0] && mp_track_url(M, id, u, sizeof u) == 0 && !strcmp(u, uri) && mp_remove(M, id) == 0) {
+		say("took back %s (%s)", rel_of(song_of_url(uri)), why);
+		done = 1;
+	}
+	forget(id);
+	return done;
+}
+
 static void take_back_pick(const char *why)
 {
-	if (!pend.id[0]) { pend.song = -1; return; }
-	/* only while that track id still is our song: VLC numbers its items afresh after it restarts */
-	char u[8192];
-	if (!no_touch && mp_track_url(M, pend.id, u, sizeof u) == 0 && !strcmp(u, pend.uri) && mp_remove(M, pend.id) == 0)
-		say("took back %s (%s)", rel_of(pend.song), why);
+	if (pend.id[0]) remove_ours(pend.id, pend.uri, why);
 	pend.id[0] = 0;
 	pend.song = -1;
 	save_pending();
@@ -449,62 +509,148 @@ static void close_play(const char *end)
 	if (ensure_card()) learn(STEPS);
 }
 
-static void decide(void)
+/* the network's view of every song in context x, then D* Lite from song s with the songs in blk[] blocked:
+ * plan[] and plan_cost. 0, or -1 when the card failed. */
+static int plan_from(int s, const float *x, const int *blk, int nblk)
 {
 	nplan = 0;
 	plan_cost = NAN;
-	const int s = cur.pl.song;
-	if (s < 0 || !ensure_card()) { write_status(); return; }
-	/* every song's recency now, the context, the network's view of every song */
-	float *r = malloc((size_t)E.n * 2 * sizeof(float)), *f = malloc((size_t)E.n * 4), *gc = malloc((size_t)E.n * 4), g[PREF_D], x[PREF_X];
+	float *r = malloc((size_t)E.n * 2 * sizeof(float)), *f = malloc((size_t)E.n * 4), *gc = malloc((size_t)E.n * 4), g[PREF_D];
 	const double t = unix_now();
-	for (int b = 0; b < E.n; b++) { r[2 * b] = r[2 * b + 1] = 0; }
+	int rc = 0;
+	/* every song's recency now, from the finished plays */
+	for (int b = 0; b < E.n; b++) r[2 * b] = r[2 * b + 1] = 0;
 	for (int j = nplays - 1, ago = 1; j >= 0; j--, ago++) {
-		const int b = plays[j].song;
+		const int b = plays[j].song >= 0 ? rep[plays[j].song] : -1;   /* the recording: every copy gets its recency below */
 		if (b < 0 || r[2 * b] != 0) continue;
 		r[2 * b] = (float)(1.0 / (1 + ago));
 		r[2 * b + 1] = (float)exp(-((t - plays[j].t1) / 3600.0) / 12.0);
 	}
-	add_play(&cur.pl);   /* the context reads the open play as the latest, then it is dropped again */
-	context_at(nplays - 1, x);
-	nplays--;
-	if (pref_score(P, x, E.mean + (size_t)s * E.d, r, f, g, gc)) { vg_close(card); card = NULL; goto out; }
+	for (int b = 0; b < E.n; b++) if (rep[b] != b) { r[2 * b] = r[2 * rep[b]]; r[2 * b + 1] = r[2 * rep[b] + 1]; }
+	if (pref_score(P, x, E.mean + (size_t)s * E.d, r, f, g, gc)) { vg_close(card); card = NULL; rc = -1; goto out; }
 	ds_set_alpha(DS, pref_alpha(P));
 	const double kap = pref_kappa(P), bet = pref_beta(P);
 	for (int b = 0; b < E.n; b++) {
 		ds_set_node(DS, b, kap * (1 - f[b]));
 		ds_set_goal(DS, b, bet * acos(gc[b] > 1 ? 1 : gc[b] < -1 ? -1 : gc[b]));
 	}
-	if (prev_blocked >= 0) ds_set_blocked(DS, prev_blocked, 0);
-	ds_set_blocked(DS, s, 1);   /* the one hard rule: not the song playing now */
-	prev_blocked = s;
+	for (int i = 0; i < nblocked; i++) ds_set_blocked(DS, blocked[i], 0);
+	nblocked = 0;
+	/* a blocked song with every copy of its recording */
+	for (int i = 0; i < nblk; i++) {
+		if (blk[i] < 0) continue;
+		for (int b = 0; b < E.n && nblocked < BLOCKS; b++)
+			if (rep[b] == rep[blk[i]]) { ds_set_blocked(DS, b, 1); blocked[nblocked++] = b; }
+	}
 	ds_move(DS, s);
 	nplan = ds_plan(DS, plan, 32, &plan_cost);
 	if (nplan > 0) say("plan from %s: %d songs, cost %.3f; next %s (predicted fraction %.3f)", rel_of(s), nplan, plan_cost, rel_of(plan[0]), f[plan[0]]);
 	else say("no plan from %s", rel_of(s));
-	/* queue the first song unless you have tracks lined up after this one, or VLC shuffles */
-	if (nplan > 0 && !no_touch) {
-		char ids[256][128];
-		const int n = mp_tracks(M, ids, 256);
-		int at = -1, user_after = 0;
-		for (int i = 0; i < n; i++) if (!strcmp(ids[i], cur.id)) at = i;
-		for (int i = at + 1; at >= 0 && i < n; i++) user_after |= strcmp(ids[i], pend.id) != 0;
-		take_back_pick("re-planned");
-		if (user_after) say("tracks are queued after this one: not adding");
-		else {
-			char p[8192];
-			snprintf(p, sizeof p, "%s/%s", root, E.rel[plan[0]]);
-			mp_uri(p, pend.uri, sizeof pend.uri);
-			if (mp_add_after(M, pend.uri, cur.id, pend.id, sizeof pend.id) == 0) {
-				pend.song = plan[0];
-				say("queued %s after %s (track %s)", rel_of(pend.song), rel_of(s), pend.id[0] ? pend.id : "?");
-				save_pending();
-			}
-		}
-	} else if (nplan > 0) pend.song = plan[0];
 out:
 	free(r); free(f); free(gc);
+	return rc;
+}
+
+static void uri_of(int song, char *uri, size_t n)
+{
+	char p[8192];
+	snprintf(p, sizeof p, "%s/%s", root, E.rel[song]);
+	mp_uri(p, uri, n);
+}
+
+/* the plan's first song right after the current track, unless you have tracks lined up after it. Our own earlier
+ * picks after it are stale (planned from another song): they go. */
+static void queue_after_current(void)
+{
+	if (no_touch) { pend.song = nplan > 0 ? plan[0] : -1; return; }
+	if (shuffling) { take_back_pick("VLC shuffles"); say("VLC shuffles: not adding"); return; }
+	char ids[256][128];
+	const int n = mp_tracks(M, ids, 256);   /* exact right after a track change */
+	int at = -1, user_after = 0;
+	for (int i = 0; i < n; i++) if (!strcmp(ids[i], cur.id)) at = i;
+	char stale_id[64][128], stale_uri[64][8192];
+	int nstale = 0;
+	for (int i = at + 1; at >= 0 && i < n; i++) {
+		const int o = is_ours(ids[i]);
+		if (o >= 0 && nstale < 64) { snprintf(stale_id[nstale], 128, "%s", ours[o].id); snprintf(stale_uri[nstale], 8192, "%s", ours[o].uri); nstale++; }
+		else if (o < 0) user_after = 1;
+	}
+	for (int i = 0; i < nstale; i++) remove_ours(stale_id[i], stale_uri[i], strcmp(stale_id[i], pend.id) ? "an older pick after this track" : "re-planned");
+	if (pend.id[0] && is_ours(pend.id) < 0) { pend.id[0] = 0; pend.song = -1; }
+	take_back_pick("re-planned");
+	if (user_after) { say("tracks you lined up follow this one: not adding"); save_pending(); return; }
+	if (nplan == 0) { save_pending(); return; }
+	uri_of(plan[0], pend.uri, sizeof pend.uri);
+	if (mp_add_after(M, pend.uri, cur.id, 0, pend.id, sizeof pend.id) == 0) {
+		pend.song = plan[0];
+		remember(&pend);
+		say("queued %s after %s (track %s)", rel_of(pend.song), rel_of(cur.pl.song), pend.id[0] ? pend.id : "?");
+	}
+	save_pending();
+}
+
+static void decide(void)
+{
+	const int s = cur.pl.song;
+	nplan = 0;
+	if (s >= 0 && ensure_card()) {
+		float x[PREF_X];
+		add_play(&cur.pl);   /* the context reads the open play as the current song, then it is dropped again */
+		context_at(nplays - 1, x);
+		nplays--;
+		/* the one hard rule: not the song playing now */
+		if (plan_from(s, x, &s, 1) == 0) queue_after_current();
+	}
 	write_status();
+}
+
+/*
+ * You skipped: the play just closed ended "next" and VLC started the track it had lined up. When that track is one of
+ * our picks, it was planned before the skip; the network has now learnt from the skip (close_play), so plan again
+ * from the last song you let play (the latest play that did not end in a skip; the skipped song itself when there
+ * is none), with every song skipped since blocked, the way a navigating agent repairs its path around newly found
+ * obstacles. When the new plan starts elsewhere, VLC plays the new song at once and the stale pick goes. Returns 1
+ * when VLC was switched.
+ */
+static int replan_after_skip(const mp_state *s)
+{
+	const int k = nplays - 1;
+	if (no_touch || shuffling || k < 0 || !card || plays[k].song < 0) return 0;
+	const int started_ours = (pend.id[0] && !strcmp(pend.id, s->trackid)) || is_ours(s->trackid) >= 0;
+	if (!started_ours) return 0;   /* VLC moved on to a track you lined up yourself */
+	int from = k - 1;
+	while (from >= 0 && !strcmp(plays[from].end, "next")) from--;   /* back over a run of skips */
+	if (from < 0 || plays[from].song < 0) from = k;
+	float x[PREF_X];
+	if (context_at(from, x)) return 0;
+	const double t0 = unix_now();
+	const int skipped = plays[k].song, start = plays[from].song, now_song = song_of_url(s->url);
+	int blk[BLOCKS], nb = 0;
+	blk[nb++] = start;
+	for (int j = from + 1; j <= k && nb < BLOCKS; j++) if (plays[j].song >= 0 && plays[j].song != start) blk[nb++] = plays[j].song;
+	if (plan_from(start, x, blk, nb) || nplan == 0) return 0;
+	if (plan[0] == now_song) {
+		skips_kept++;
+		say("after the skip of %s the plan still starts with %s: keeping it", rel_of(skipped), rel_of(now_song));
+		return 0;
+	}
+	pick next = { "", plan[0], "" };
+	uri_of(plan[0], next.uri, sizeof next.uri);
+	if (mp_add_after(M, next.uri, s->trackid, 1, next.id, sizeof next.id)) return 0;
+	sw.active = 1;
+	snprintf(sw.id, sizeof sw.id, "%s", next.id);
+	snprintf(sw.uri, sizeof sw.uri, "%s", next.uri);
+	sw.stale = (pick){ "", now_song, "" };
+	snprintf(sw.stale.id, sizeof sw.stale.id, "%s", s->trackid);
+	snprintf(sw.stale.uri, sizeof sw.stale.uri, "%s", s->url);
+	sw.until = unix_now() + 5;
+	pend = next;
+	remember(&pend);
+	save_pending();
+	skips_replanned++;
+	say("skip of %s: playing %s instead of %s (re-planned from %s in %.0f ms after learning)", rel_of(skipped), rel_of(plan[0]),
+	    rel_of(now_song), rel_of(start), 1e3 * (unix_now() - t0));
+	return 1;
 }
 
 static void open_play(const mp_state *s)
@@ -516,12 +662,12 @@ static void open_play(const mp_state *s)
 	cur.pl.t0 = unix_now();
 	cur.pl.length = s->length_us / 1e6;
 	cur.pl.song = song_of_url(s->url);
-	const int ours = pend.id[0] && !strcmp(pend.id, s->trackid);
-	snprintf(cur.pl.source, sizeof cur.pl.source, "%s", ours ? "vibe" : "user");
+	const int ours_now = (pend.id[0] && !strcmp(pend.id, s->trackid)) || is_ours(s->trackid) >= 0;
+	snprintf(cur.pl.source, sizeof cur.pl.source, "%s", ours_now ? "vibe" : "user");
 	static int seen_start;   /* the first track after vibed starts was not chosen against a pick of this run */
-	cur.pl.queued = ours || !seen_start ? -1 : pend.song;   /* our waiting pick when you chose this one instead */
+	cur.pl.queued = ours_now || !seen_start ? -1 : pend.song;   /* our waiting pick when you chose this one instead */
 	seen_start = 1;
-	if (ours) { pend.id[0] = 0; pend.song = -1; save_pending(); }
+	if (ours_now) { forget(s->trackid); if (!strcmp(pend.id, s->trackid)) { pend.id[0] = 0; pend.song = -1; } save_pending(); }
 	cur.last_pos = s->pos_us / 1e6;
 	/* the item VLC lines up after this one (its play order is fresh right after a track change) */
 	char ids[256][128];
@@ -539,26 +685,49 @@ static void tick(void)
 		if (cur.open) close_play("quit");
 		pend.id[0] = 0;
 		pend.song = -1;
+		nours = 0;
+		sw.active = 0;
 		return;
 	}
+	shuffling = s.shuffle;
 	/* tracks you add while our pick waits: yours go first */
 	mp_added add[16];
 	const int na = mp_take_added(M, add, 16);
 	for (int i = 0; i < na; i++)
-		if (pend.id[0] && strcmp(add[i].trackid, pend.id) && strcmp(add[i].url, pend.uri)) { take_back_pick("you added a track"); break; }
+		if (pend.id[0] && is_ours(add[i].trackid) < 0 && strcmp(add[i].url, pend.uri)) { take_back_pick("you added a track"); break; }
+	/* after a skip we told VLC to play the re-planned song: wait for it (5 s at most), then drop the stale pick */
+	if (sw.active) {
+		const int there = (sw.id[0] && !strcmp(s.trackid, sw.id)) || !strcmp(s.url, sw.uri);
+		if (!there && unix_now() < sw.until) return;
+		sw.active = 0;
+		if (there) { if (strcmp(sw.stale.id, s.trackid)) remove_ours(sw.stale.id, sw.stale.uri, "replaced after the skip"); }
+		else say("VLC did not switch to the re-planned song within 5 s");
+		cur.id[0] = 0;
+	}
 	const int playing = !strcmp(s.status, "Playing"), paused = !strcmp(s.status, "Paused");
 	if (!s.trackid[0] || (!playing && !paused)) {
-		if (cur.open) close_play(cur.pl.length - cur.last_pos <= NEAR_END ? "natural" : "stop");
+		if (cur.open) {
+			const double t = unix_now();
+			if (stop_since == 0) stop_since = t;
+			if (t - stop_since < 1.0) return;   /* a stop counts once it has lasted a second */
+			close_play(cur.pl.length - cur.last_pos <= NEAR_END ? "natural" : "stop");
+		}
+		stop_since = 0;
 		cur.id[0] = 0;
 		return;
 	}
+	stop_since = 0;
 	if (strcmp(s.trackid, cur.id) || strcmp(s.url, cur.url) || !cur.open) {
+		int skipped = 0;
 		if (cur.open) {
-			const char *end = cur.pl.length - cur.last_pos <= NEAR_END ? "natural"
-			                  : (cur.next_id[0] && !strcmp(s.trackid, cur.next_id)) || (pend.id[0] && !strcmp(s.trackid, pend.id)) ? "next" : "pick";
+			const int lined_up = (cur.next_id[0] && !strcmp(s.trackid, cur.next_id)) || (pend.id[0] && !strcmp(s.trackid, pend.id)) ||
+			                     is_ours(s.trackid) >= 0;
+			const char *end = cur.pl.length - cur.last_pos <= NEAR_END ? "natural" : lined_up ? "next" : "pick";
+			skipped = !strcmp(end, "next");
 			close_play(end);
 		}
 		if (!playing) { /* a new track shown while paused: wait until it plays */ snprintf(cur.id, sizeof cur.id, "%s", s.trackid); snprintf(cur.url, sizeof cur.url, "%s", s.url); return; }
+		if (skipped && replan_after_skip(&s)) { cur.id[0] = 0; return; }
 		open_play(&s);
 		decide();
 		return;
@@ -572,13 +741,18 @@ static void on_signal(int sig) { (void)sig; quit = 1; }
 int main(int argc, char **argv)
 {
 	int do_import = 0, opt;
-	while ((opt = getopt(argc, argv, "in")) != -1) {
+	const char *busname = NULL, *state = NULL;
+	while ((opt = getopt(argc, argv, "inb:d:")) != -1) {
 		if (opt == 'i') do_import = 1;
 		else if (opt == 'n') no_touch = 1;
-		else { fprintf(stderr, "usage: vibed [-i] [-n]\n"); return 2; }
+		else if (opt == 'b') busname = optarg;
+		else if (opt == 'd') state = optarg;
+		else { fprintf(stderr, "usage: vibed [-i] [-n] [-b MPRIS_NAME] [-d STATE_DIR]\n"); return 2; }
 	}
 	setvbuf(stderr, NULL, _IOLBF, 0);
-	snprintf(dir, sizeof dir, "%s/.local/share/phivibe", getenv("HOME"));
+	if (state) snprintf(dir, sizeof dir, "%s", state);
+	else snprintf(dir, sizeof dir, "%s/.local/share/phivibe", getenv("HOME"));
+	mkdir(dir, 0755);
 	snprintf(path_events, sizeof path_events, "%s/events.tsv", dir);
 	snprintf(path_pref, sizeof path_pref, "%s/pref.bin", dir);
 	snprintf(path_status, sizeof path_status, "%s/status.txt", dir);
@@ -586,6 +760,8 @@ int main(int argc, char **argv)
 	root = vibe_root();
 	if (emb_load(&E, NULL)) return 1;
 	load_lengths();
+	rep = malloc((size_t)E.n * sizeof(int));   /* each song its own recording until dup_groups runs on the card */
+	for (int i = 0; i < E.n; i++) rep[i] = i;
 	P = pref_load(path_pref);
 	if (!P) { P = pref_new(0xfeed); say("new preference network (%ld parameters)", pref_nparams()); }
 	else say("preference network loaded: step %ld", P->step);
@@ -597,18 +773,23 @@ int main(int argc, char **argv)
 		for (int i = 0; i < nplays; i++) log_play(&plays[i]);
 	}
 	for (int i = 0; i < nplays; i++) if (plays[i].length <= 0 && plays[i].song >= 0) plays[i].length = lengths[plays[i].song];
-	say("%d songs embedded (encoder step %lld), library %s, %d plays logged%s", E.n, (long long)E.step, root, nplays, no_touch ? ", watch only" : "");
+	say("%d songs embedded (encoder step %lld), library %s, %d plays logged, state %s%s", E.n, (long long)E.step, root, nplays, dir,
+	    no_touch ? ", watch only" : "");
 	M = mp_open();
-	load_pending();
 	if (!M) { say("no session bus"); return 1; }
+	if (busname) { mp_set_name(M, busname); say("player %s only", busname); }
+	load_pending();
 	signal(SIGTERM, on_signal);
 	signal(SIGINT, on_signal);
 	if (ensure_card() && !had_log && nplays > 1) learn(200);
 	write_status();
+	double last = 0;
 	while (!quit) {
-		tick();
+		/* a tick at least every second, and at once (at most 10 a second) when a player announces a change */
+		const double t = unix_now();
+		if (t - last >= 0.1) { tick(); last = t; }
 		if (!card && ensure_card()) write_status();
-		sleep(1);
+		mp_wait(M, 1.0);
 	}
 	/* a play still open when vibed stops is not finished: it is not logged (VLC quitting is: see tick) */
 	if (P) pref_save(P, path_pref);

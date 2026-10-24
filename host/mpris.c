@@ -19,6 +19,9 @@ struct mpris {
 	sd_bus_slot *slot;
 	char name[256];              /* VLC's bus name */
 	mp_added added[ADDED_MAX];   /* TrackAdded signals not yet taken */
+	sd_bus_slot *slot2;
+	int changed;                 /* a PropertiesChanged arrived since the last mp_wait */
+	int fixed;                   /* name was given (mp_set_name): only that player */
 	int nadded;
 };
 
@@ -68,11 +71,19 @@ static int on_added(sd_bus_message *msg, void *ud, sd_bus_error *err)
 	return 0;
 }
 
+static int on_changed(sd_bus_message *msg, void *ud, sd_bus_error *err)
+{
+	(void)msg; (void)err;
+	((mpris *)ud)->changed = 1;
+	return 0;
+}
+
 mpris *mp_open(void)
 {
 	mpris *m = calloc(1, sizeof *m);
 	if (sd_bus_open_user(&m->bus) < 0) { free(m); return NULL; }
-	if (sd_bus_add_match(m->bus, &m->slot, "type='signal',path='" PATH "',member='TrackAdded'", on_added, m) < 0) {
+	if (sd_bus_add_match(m->bus, &m->slot, "type='signal',path='" PATH "',member='TrackAdded'", on_added, m) < 0 ||
+	    sd_bus_add_match(m->bus, &m->slot2, "type='signal',path='" PATH "',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'", on_changed, m) < 0) {
 		sd_bus_unref(m->bus);
 		free(m);
 		return NULL;
@@ -84,6 +95,7 @@ void mp_close(mpris *m)
 {
 	if (!m) return;
 	sd_bus_slot_unref(m->slot);
+	sd_bus_slot_unref(m->slot2);
 	sd_bus_flush_close_unref(m->bus);
 	free(m);
 }
@@ -93,9 +105,36 @@ static void pump(mpris *m)
 	while (sd_bus_process(m->bus, NULL) > 0) {}
 }
 
-/* the first VLC name on the bus into m->name; 1, 0 none, -1 bus error */
+void mp_set_name(mpris *m, const char *name)
+{
+	copy(m->name, sizeof m->name, name);
+	m->fixed = 1;
+}
+
+int mp_wait(mpris *m, double seconds)
+{
+	m->changed = 0;
+	pump(m);
+	if (!m->changed) sd_bus_wait(m->bus, (uint64_t)(seconds * 1e6));
+	pump(m);
+	return m->changed;
+}
+
+/* the player's bus name into m->name (the given one, or the first VLC); 1, 0 none, -1 bus error */
 static int find_vlc(mpris *m)
 {
+	if (m->fixed) {
+		sd_bus_error e = SD_BUS_ERROR_NULL;
+		sd_bus_message *rep = NULL;
+		int has = 0;
+		if (sd_bus_call_method(m->bus, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner", &e, &rep, "s", m->name) < 0) {
+			sd_bus_error_free(&e);
+			return -1;
+		}
+		sd_bus_message_read(rep, "b", &has);
+		sd_bus_message_unref(rep);
+		return has ? 1 : 0;
+	}
 	sd_bus_error e = SD_BUS_ERROR_NULL;
 	sd_bus_message *r = NULL;
 	char **names = NULL;
@@ -134,6 +173,9 @@ int mp_read(mpris *m, mp_state *s)
 	sd_bus_error_free(&e);
 	sd_bus_get_property_trivial(m->bus, m->name, PATH, PLAYER, "Position", &e, 'x', &s->pos_us);
 	sd_bus_error_free(&e);
+	int sh = 0;
+	if (sd_bus_get_property_trivial(m->bus, m->name, PATH, PLAYER, "Shuffle", &e, 'b', &sh) >= 0) s->shuffle = sh;
+	sd_bus_error_free(&e);
 	return 1;
 }
 
@@ -159,17 +201,17 @@ static double mono(void)
 	return t.tv_sec + t.tv_nsec / 1e9;
 }
 
-int mp_add_after(mpris *m, const char *uri, const char *after, char *id, size_t idlen)
+int mp_add_after(mpris *m, const char *uri, const char *after, int play, char *id, size_t idlen)
 {
 	sd_bus_error e = SD_BUS_ERROR_NULL;
 	pump(m);
-	if (!m->name[0] || sd_bus_call_method(m->bus, m->name, PATH, TRACKLIST, "AddTrack", &e, NULL, "sob", uri, after, 0) < 0) {
+	if (!m->name[0] || sd_bus_call_method(m->bus, m->name, PATH, TRACKLIST, "AddTrack", &e, NULL, "sob", uri, after, play ? 1 : 0) < 0) {
 		sd_bus_error_free(&e);
 		return -1;
 	}
-	/* VLC announces the new item with TrackAdded: wait for the one with our url (half a second at most) */
+	/* VLC announces the new item with TrackAdded: wait for the one with our url (a tenth of a second at most) */
 	const double t0 = mono();
-	while (mono() - t0 < 0.5) {
+	while (mono() - t0 < 0.1) {
 		for (int i = m->nadded - 1; i >= 0; i--)
 			if (!strcmp(m->added[i].url, uri)) {
 				copy(id, idlen, m->added[i].trackid);

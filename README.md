@@ -11,7 +11,7 @@ an Intel Xeon Phi 7120A coprocessor card; everything else runs on the host CPU.
 | `vibe-train`: the vibe encoder, trained on the card | done, measured against chance and a hand-made baseline |
 | Next-song planner: D* Lite over the vibe graph (`host/dstar.c`) | done, gated against Dijkstra |
 | Preference network that learns from plays (`host/pref.c`) | done, gradient-checked, cold-start gated |
-| `vibed`: watches VLC over MPRIS, learns, queues the pick | running; its first queued pick played (see Measured) |
+| `vibed`: watches VLC over MPRIS, learns, queues the pick, re-plans after a skip | running; picks played, skips re-planned (see Measured) |
 
 ## How it works
 
@@ -55,6 +55,14 @@ It has two heads and three mixing weights:
 - **Fraction head.** Predicts the fraction of each song you would play now. It sees the song's vibe, a context and how recently the song played. The context is the current song, your last eight plays weighted by how much of each you played, and the time of day and week.
 - **Goal head.** Predicts the vibe your listening is heading toward.
 - **Mixing weights** (α, β, κ). They weigh vibe smoothness, predicted fraction and distance to the goal. They are trained only on your own choices: when you start a song instead of the queued one, yours should cost less.
+
+**When you skip** (Next before the end), the pick VLC starts was planned before the skip. `vibed` handles it like a navigating agent that finds a new obstacle:
+- the network learns from the skip at once;
+- the plan is repaired from the last song you let play (the latest play that did not end in a skip), with every song skipped since blocked;
+- if the repaired plan starts with a different song, VLC switches to it straight away, and the stale pick, heard for about a tenth of a second, is removed and not logged as a play;
+- a track you lined up yourself is never replaced.
+
+Copies of one recording count as one song: blocking, recency and skips all treat them together. Copies are vibe vectors at cosine ≥ 0.9999; 385 songs in the library have at least one.
 
 There are no play counts, no transition tables and no hand-set thresholds. How much of a song was played, and how recently each song played, are inputs and targets, not rules. The only fixed rule: never the song playing now. Before the first play the recency weights start strongly negative, so a song you just heard is avoided while the network knows nothing else.
 
@@ -125,6 +133,15 @@ All on one 7120A (61 cores, 1.238 GHz, 16 GB GDDR5) in a Ryzen 7 5800X desktop. 
   - one seed passes everything at 10⁻³, worst 6.9 × 10⁻³.
 - Cold start: 50 untrained decisions through D* Lite with 0 repeats, 0 hops off the graph, 0 empty plans and 0 NaN. Scoring all 6,027 songs on the card takes 2.08 ms.
 
+**Skips** were tested on a private D-Bus session, with a second VLC on dummy audio and video outputs, so nothing touched the real player or the speakers. Four runs of four skips (`tools/skiptest.sh`):
+- **Detection:** every skip was classified `next`. VLC reports `Stopped` for an instant while it switches tracks, so a stop only counts once it has lasted 1 s.
+- **Learning and switch:** the network took 16 Adam steps on the card in 87 to 92 ms. VLC played the re-planned song 0.115 to 0.227 s after Next (6 switches).
+- **Agreement:** when the repaired plan agreed with the queued pick, the pick was kept.
+- **Your tracks:** a track lined up by hand played and was not replaced.
+- **Copies:** a skipped song's copy in another folder was chosen 0 times, after the fix. Before it, a skip of "Pegboards - Hero" brought back its copy from `ytmusic/`.
+
+**Copies** (`dups`): nearest-song cosine ≥ 0.9999 for 385 songs (most exactly 1.000000), against 17 between 0.9995 and 0.9999.
+
 **History**: 72 plays imported from the vlc-discord journal. 13 titles matched no library file. 50 plays were at 90 % or more and 15 under 10 %.
 
 **End to end** (2026-10-24, live):
@@ -165,8 +182,8 @@ cat ~/.local/share/phivibe/status.txt
 ```
 
 **`vibed` and VLC**
-- It never plays, pauses, seeks or changes the volume. It only adds one track right after the current one.
-- It adds nothing while you have tracks queued after the current one, or while VLC shuffles. If you add tracks while its pick is waiting, it takes its pick back.
+- It never pauses, seeks or changes the volume. It adds one track right after the current one. The only time it starts a track itself is the switch to the re-planned song right after you skip one of its picks.
+- It adds nothing while you have tracks queued after the current one, or while VLC shuffles. If you add tracks while its pick is waiting, it takes the pick back: at once when VLC sends `TrackAdded` in time, otherwise at the next track change, when the play order can be read exactly.
 - Its files live in `~/.local/share/phivibe`: `events.tsv` (every play), `pref.bin` (the network), `status.txt` (now, the plan, the weights) and `pending` (the waiting pick).
 
 ## Limits

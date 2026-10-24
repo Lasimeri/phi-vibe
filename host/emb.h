@@ -29,4 +29,8 @@ const char *vibe_root(void);
 /* the same with CSLS-corrected similarity (2 cos(a, b) - r_a - r_b, r = mean cosine to the k nearest): fewer hubs */
 int graph_build_csls(vg *v, const float *X, int n, int d, int k, int **off, int **adj);
 
+/* copies of one recording: songs whose vibes have cosine >= thr (0.9999: identical audio) share rep[] (the group's
+ * lowest index); returns how many songs have a copy, or -1 */
+int dup_groups(vg *v, const float *X, int n, int d, double thr, int *rep);
+
 #endif

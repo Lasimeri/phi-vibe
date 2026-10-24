@@ -17,6 +17,7 @@ typedef struct {
 	char trackid[128];      /* mpris:trackid */
 	char url[8192];         /* xesam:url, percent-encoded */
 	int64_t length_us, pos_us;
+	int shuffle;            /* VLC plays its list in random order */
 } mp_state;
 
 typedef struct {
@@ -29,14 +30,20 @@ typedef struct mpris mpris;
 mpris *mp_open(void);
 void mp_close(mpris *m);
 
+/* only this player (an exact bus name, e.g. org.mpris.MediaPlayer2.vlc.instance1234), not the first VLC found */
+void mp_set_name(mpris *m, const char *name);
+
+/* waits up to seconds for the bus; returns early, 1, when a player announced a property change */
+int mp_wait(mpris *m, double seconds);
+
 /* 1 with the state of VLC, 0 when VLC is not on the bus, -1 when the bus failed */
 int mp_read(mpris *m, mp_state *s);
 
 /* the track list as VLC last built it: up to max ids into ids (each 128 bytes); the count, or -1 */
 int mp_tracks(mpris *m, char (*ids)[128], int max);
 
-/* adds uri right after track `after` (not made current); its new track id into id. 0, or -1. */
-int mp_add_after(mpris *m, const char *uri, const char *after, char *id, size_t idlen);
+/* adds uri right after track `after`, and plays it at once when play is set; its new track id into id. 0, or -1. */
+int mp_add_after(mpris *m, const char *uri, const char *after, int play, char *id, size_t idlen);
 int mp_remove(mpris *m, const char *trackid);
 
 /* tracks VLC announced as added since the last call (any source); returns how many, at most max */
